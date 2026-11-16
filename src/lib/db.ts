@@ -35,6 +35,11 @@ export async function upsertConfig(
   }
 }
 
+export async function deleteConfig(id: string): Promise<void> {
+  const { error } = await supabase.from("fdroid_config").delete().eq("id", id);
+  if (error) throw new Error(error.message);
+}
+
 export async function getApps(configId: string): Promise<FdroidApp[]> {
   const { data, error } = await supabase
     .from("fdroid_apps")
@@ -70,5 +75,12 @@ export async function upsertApp(
 
 export async function deleteApp(id: string): Promise<void> {
   const { error } = await supabase.from("fdroid_apps").delete().eq("id", id);
+  if (error) throw new Error(error.message);
+}
+
+export async function bulkInsertApps(
+  apps: Array<Partial<FdroidApp> & { config_id: string }>
+): Promise<void> {
+  const { error } = await supabase.from("fdroid_apps").insert(apps);
   if (error) throw new Error(error.message);
 }

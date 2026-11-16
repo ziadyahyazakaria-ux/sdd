@@ -10,10 +10,12 @@ import ExpandableSection from "@cloudscape-design/components/expandable-section"
 import ProgressBar from "@cloudscape-design/components/progress-bar";
 import CopyToClipboard from "@cloudscape-design/components/copy-to-clipboard";
 import ColumnLayout from "@cloudscape-design/components/column-layout";
+import Spinner from "@cloudscape-design/components/spinner";
 import { QRCodeSVG } from "qrcode.react";
 import { getApps } from "../lib/db";
 import { buildIndexV1, prepareRepo } from "../lib/fdroidIndex";
 import { bytesToBase64, getOrCreateBranch, githubHeaders, textToBase64, upsertFile } from "../lib/github";
+import { escapeHtml } from "../lib/validation";
 import type { FdroidConfig, FdroidApp } from "../lib/types";
 
 interface Props {
@@ -26,6 +28,19 @@ interface DeployStep {
   message?: string;
 }
 
+interface DeployHistoryEntry {
+  timestamp: string;
+  status: "success" | "error";
+  message: string;
+  commitSha?: string;
+  repoUrl: string;
+}
+
+interface ConnectionTestResult {
+  status: "success" | "error" | "pending";
+  message: string;
+}
+
 export default function DeployPage({ config }: Props) {
   const [apps, setApps] = useState<FdroidApp[]>([]);
   const [loading, setLoading] = useState(true);
@@ -34,6 +49,9 @@ export default function DeployPage({ config }: Props) {
   const [deployError, setDeployError] = useState<string | null>(null);
   const [deploySuccess, setDeploySuccess] = useState(false);
   const [preview, setPreview] = useState("");
+  const [history, setHistory] = useState<DeployHistoryEntry[]>([]);
+  const [connTest, setConnTest] = useState<ConnectionTestResult | null>(null);
+  const [testingConn, setTestingConn] = useState(false);
 
   const updateStep = useCallback(
     (index: number, status: DeployStep["status"], message?: string) => {
@@ -44,6 +62,8 @@ export default function DeployPage({ config }: Props) {
     []
   );
 
+  const repoUrl = `https://${config.github_owner}.github.io/${config.github_repo}/fdroid/repo`;
+
   useEffect(() => {
     getApps(config.id)
       .then((data) => {
@@ -53,14 +73,80 @@ export default function DeployPage({ config }: Props) {
       })
       .catch((e) => setDeployError(e.message))
       .finally(() => setLoading(false));
+
+    const stored = localStorage.getItem(`deploy_history_${config.id}`);
+    if (stored) {
+      try { setHistory(JSON.parse(stored)); } catch { /* ignore */ }
+    }
   }, [config]);
+
+  function saveHistory(entry: DeployHistoryEntry) {
+    const updated = [entry, ...history].slice(0, 20);
+    setHistory(updated);
+    localStorage.setItem(`deploy_history_${config.id}`, JSON.stringify(updated));
+  }
+
+  async function handleTestConnection() {
+    const token = localStorage.getItem(`gh_token_${config.id}`);
+    if (!token) {
+      setConnTest({ status: "error", message: "No GitHub token found. Add one in Repository Setup." });
+      return;
+    }
+    setTestingConn(true);
+    setConnTest({ status: "pending", message: "Testing..." });
+    try {
+      const res = await fetch(`https://api.github.com/repos/${config.github_owner}/${config.github_repo}`, {
+        headers: githubHeaders(token),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        setConnTest({ status: "error", message: `Repository check failed: ${err.message}` });
+        return;
+      }
+      const data = await res.json();
+
+      const scopesRes = await fetch(`https://api.github.com/user`, {
+        headers: githubHeaders(token),
+      });
+      if (!scopesRes.ok) {
+        setConnTest({ status: "error", message: "Token verification failed. Check your token permissions." });
+        return;
+      }
+
+      const branchRes = await fetch(
+        `https://api.github.com/repos/${config.github_owner}/${config.github_repo}/branches/${config.github_branch}`,
+        { headers: githubHeaders(token) }
+      );
+      const branchExists = branchRes.ok;
+
+      let pagesStatus = "unknown";
+      const pagesRes = await fetch(
+        `https://api.github.com/repos/${config.github_owner}/${config.github_repo}/pages`,
+        { headers: githubHeaders(token) }
+      );
+      if (pagesRes.ok) {
+        const pagesData = await pagesRes.json();
+        pagesStatus = pagesData.status ?? "unknown";
+      }
+
+      setConnTest({
+        status: "success",
+        message: `Repository: ${data.full_name} | Branch "${config.github_branch}": ${branchExists ? "exists" : "will be created"} | GitHub Pages: ${pagesStatus === "unknown" ? "not configured (optional)" : pagesStatus}`,
+      });
+    } catch (e: unknown) {
+      setConnTest({
+        status: "error",
+        message: e instanceof Error ? e.message : "Connection test failed.",
+      });
+    } finally {
+      setTestingConn(false);
+    }
+  }
 
   async function handleDeploy() {
     const token = localStorage.getItem(`gh_token_${config.id}`);
     if (!token) {
-      setDeployError(
-        "No GitHub Personal Access Token found. Please save one in the Setup page first."
-      );
+      setDeployError("No GitHub Personal Access Token found. Please save one in the Setup page first.");
       return;
     }
 
@@ -102,9 +188,7 @@ export default function DeployPage({ config }: Props) {
       updateStep(3, "in-progress");
       for (const file of prepared.files) {
         await upsertFile(
-          owner,
-          repo,
-          branch,
+          owner, repo, branch,
           `fdroid/repo/${file.path}`,
           bytesToBase64(file.bytes),
           token,
@@ -116,31 +200,31 @@ export default function DeployPage({ config }: Props) {
       updateStep(4, "in-progress");
       const indexJson = JSON.stringify(
         buildIndexV1(config, apps, prepared.apps, prepared.repoIconName),
-        null,
-        2
+        null, 2
       );
-      await upsertFile(
-        owner,
-        repo,
-        branch,
+      const indexRes = await upsertFile(
+        owner, repo, branch,
         "fdroid/repo/index-v1.json",
         textToBase64(indexJson),
         token,
         `Update F-Droid index [${new Date().toISOString()}]`
       );
+      void indexRes;
       setPreview(indexJson);
       updateStep(4, "success");
 
       updateStep(5, "in-progress");
+      const safeName = escapeHtml(config.repo_name);
+      const safeDesc = escapeHtml(config.repo_description);
+      const safeOwner = escapeHtml(owner);
+      const safeRepo = escapeHtml(repo);
       const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>F-Droid Repository</title></head><body>
-<h1>${config.repo_name}</h1>
-<p>${config.repo_description}</p>
-<p>Add this repository to F-Droid: <code>https://${owner}.github.io/${repo}/fdroid/repo</code></p>
+<h1>${safeName}</h1>
+<p>${safeDesc}</p>
+<p>Add this repository to F-Droid: <code>https://${safeOwner}.github.io/${safeRepo}/fdroid/repo</code></p>
 </body></html>`;
       await upsertFile(
-        owner,
-        repo,
-        branch,
+        owner, repo, branch,
         "fdroid/index.html",
         textToBase64(html),
         token,
@@ -149,12 +233,19 @@ export default function DeployPage({ config }: Props) {
       updateStep(5, "success");
 
       setDeploySuccess(true);
+      saveHistory({
+        timestamp: new Date().toISOString(),
+        status: "success",
+        message: `Deployed ${apps.length} app(s)`,
+        repoUrl,
+      });
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Deploy failed.";
       setDeployError(msg);
       setSteps((prev) =>
         prev.map((s) => (s.status === "in-progress" ? { ...s, status: "error", message: msg } : s))
       );
+      saveHistory({ timestamp: new Date().toISOString(), status: "error", message: msg, repoUrl });
     } finally {
       setDeploying(false);
     }
@@ -162,8 +253,6 @@ export default function DeployPage({ config }: Props) {
 
   const completedSteps = steps.filter((s) => s.status === "success").length;
   const progress = steps.length > 0 ? Math.round((completedSteps / steps.length) * 100) : 0;
-
-  const repoUrl = `https://${config.github_owner}.github.io/${config.github_repo}/fdroid/repo`;
 
   return (
     <SpaceBetween size="l">
@@ -180,15 +269,20 @@ export default function DeployPage({ config }: Props) {
               variant="h2"
               description="Push your F-Droid repository index to GitHub."
               actions={
-                <Button
-                  variant="primary"
-                  onClick={handleDeploy}
-                  loading={deploying}
-                  disabled={loading || apps.length === 0}
-                  iconName="upload"
-                >
-                  Deploy to GitHub
-                </Button>
+                <SpaceBetween direction="horizontal" size="xs">
+                  <Button onClick={handleTestConnection} loading={testingConn}>
+                    Test connection
+                  </Button>
+                  <Button
+                    variant="primary"
+                    onClick={handleDeploy}
+                    loading={deploying}
+                    disabled={loading || apps.length === 0}
+                    iconName="upload"
+                  >
+                    Deploy to GitHub
+                  </Button>
+                </SpaceBetween>
               }
             >
               Deploy
@@ -218,6 +312,18 @@ export default function DeployPage({ config }: Props) {
               <Box variant="awsui-key-label">Apps in repo</Box>
               <Box>{apps.length}</Box>
             </Box>
+            {connTest && (
+              <Box>
+                <Box variant="awsui-key-label">Connection test</Box>
+                {connTest.status === "pending" ? (
+                  <Spinner />
+                ) : connTest.status === "success" ? (
+                  <StatusIndicator type="success">{connTest.message}</StatusIndicator>
+                ) : (
+                  <StatusIndicator type="error">{connTest.message}</StatusIndicator>
+                )}
+              </Box>
+            )}
           </SpaceBetween>
         </Container>
 
@@ -232,20 +338,8 @@ export default function DeployPage({ config }: Props) {
           }
         >
           <Box textAlign="center" padding="l">
-            <div
-              style={{
-                display: "inline-block",
-                padding: 16,
-                borderRadius: 16,
-                background: "#ffffff",
-              }}
-            >
-              <QRCodeSVG
-                value={repoUrl}
-                size={200}
-                level="M"
-                includeMargin={false}
-              />
+            <div style={{ display: "inline-block", padding: 16, borderRadius: 16, background: "#ffffff" }}>
+              <QRCodeSVG value={repoUrl} size={200} level="M" includeMargin={false} />
             </div>
             <Box variant="p" color="text-body-secondary" padding={{ top: "s" }}>
               Point your phone camera at this code, then tap the link to open it in F-Droid.
@@ -302,6 +396,25 @@ export default function DeployPage({ config }: Props) {
                 </Box>
               ))}
             </SpaceBetween>
+          </SpaceBetween>
+        </Container>
+      )}
+
+      {history.length > 0 && (
+        <Container header={<Header variant="h2" description="Recent deployment attempts.">Deployment history</Header>}>
+          <SpaceBetween size="s">
+            {history.map((entry, i) => (
+              <Box key={i}>
+                <SpaceBetween direction="horizontal" size="s">
+                  <StatusIndicator type={entry.status === "success" ? "success" : "error"}>
+                    {entry.message}
+                  </StatusIndicator>
+                  <Box variant="code" fontSize="body-s">
+                    {new Date(entry.timestamp).toLocaleString()}
+                  </Box>
+                </SpaceBetween>
+              </Box>
+            ))}
           </SpaceBetween>
         </Container>
       )}

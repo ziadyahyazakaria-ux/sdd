@@ -1,17 +1,20 @@
 export interface FdroidConfig {
   id: string;
+  user_id: string;
   github_owner: string;
   github_repo: string;
   github_branch: string;
   repo_name: string;
   repo_description: string;
   repo_icon: string;
+  target_sdk: number;
   created_at: string;
   updated_at: string;
 }
 
 export interface FdroidApp {
   id: string;
+  user_id: string;
   config_id: string;
   package_name: string;
   name: string;

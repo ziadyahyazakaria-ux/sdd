@@ -162,7 +162,7 @@ export function buildIndexV1(
               apkName: `${app.package_name}_${app.version_code}.apk`,
               download: app.apk_url,
               minSdkVersion: app.min_sdk,
-              targetSdkVersion: app.min_sdk,
+              targetSdkVersion: config.target_sdk ?? 34,
               size: p?.apkSize ?? 0,
               hash: p?.apkSha256 ?? "",
               hashType: "sha256",
